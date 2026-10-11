@@ -1,0 +1,5 @@
+# The host fingerprints mod files by content, so keep every checkout byte-identical.
+* text=auto eol=lf
+*.jpg binary
+*.png binary
+*.webp binary
