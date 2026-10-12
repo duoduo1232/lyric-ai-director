@@ -1,42 +1,36 @@
 // mods/lyric-ai-director/index.cjs
 //
 // Node half of "AI 歌词动画导演". The renderer decides *what* to change (it owns
-// the visualizer settings); this half only asks the user's configured AI for a
-// decision, reusing the host's own AI plumbing so the mod behaves exactly like
-// the built-in AI theme feature:
+// the visualizer settings); this half only asks the AI for a decision.
 //
-//   - the same store (electron-store, projectName 'Folia' -> %APPDATA%\Folia\config.json),
-//     so OPENAI_API_URL / OPENAI_API_KEY / OPENAI_API_MODEL / OPENAI_API_TEMPERATURE /
-//     OPENAI_API_STREAM / AI_PROVIDER are the values the user already set;
-//   - the same request builder and reasoning/response_format negotiation
-//     (electron/aiTextClient.cjs, shared/openAICompatibleRequest.mjs), which is what
-//     makes DeepSeek-style endpoints and `stream: true` work without special cases;
-//   - the same 120s timeout and the same "the model spent its budget reasoning"
-//     diagnosis.
+// The mod owns its AI connection outright — it does not read Folia's config,
+// and it does not load any of the host's private modules:
 //
-// The host's modules are loaded from the app directory at call time, never at
-// activation time: a missing/renamed internal degrades to a clear error message
-// in the mod panel instead of breaking the mod's activation.
+//   - The endpoint, model and temperature come from the mod's own settings
+//     (sent along with each request by the client half).
+//   - The API key is stored here, sealed with Electron's safeStorage (DPAPI on
+//     Windows, Keychain on macOS, libsecret/kwallet on Linux), so the ciphertext
+//     is all that reaches mod-data.json. It is decrypted per request and never
+//     crosses IPC after the user types it.
+//   - Requests go out through Electron's `net.fetch`, which rides Chromium's
+//     network stack and therefore follows the system proxy like the rest of the
+//     app; Node's global fetch ignores it.
+//
+// This is also why the mod works on Folia 0.7.18+, where the host's own AI keys
+// are sealed and unreadable by mods by design: it never needed them.
 
-const path = require('path');
+'use strict';
 
 const MAX_LINES_IN_PROMPT = 48;
 const MAX_CHARS_PER_LINE = 90;
+const REQUEST_TIMEOUT_MS = 90000;
+const MAX_TOKENS = 2048;
+const DEFAULT_MODEL = 'gpt-4o-mini';
 
-/* The decision contract. Kept loose on purpose: `mode` and `params` are validated
- * in the renderer against the live visualizer registry, and strict schemas make
- * the long tail of OpenAI-compatible endpoints reject the whole request. */
-const DECISION_SCHEMA = {
-  type: 'object',
-  properties: {
-    mode: { type: 'string' },
-    reason: { type: 'string' },
-    params: { type: 'object' },
-  },
-  required: ['mode'],
-  additionalProperties: true,
-};
-
+/* The decision contract, spelled out in the prompt. Deliberately loose: `mode`
+ * and `params` are validated in the renderer against the live visualizer
+ * registry, and strict JSON schemas make the long tail of OpenAI-compatible
+ * endpoints reject the whole request. */
 const SYSTEM_PROMPT = [
   '你是一位歌词动画导演，为一个音乐播放器挑选“歌词动画模式”并微调其参数。',
   '',
@@ -62,35 +56,212 @@ const SYSTEM_PROMPT = [
   '9. “最近用过的模式”指别的歌用过什么：列出它是为了提醒你别让所有歌都长一个样。除非这首歌确实更适合其中某个，否则优先挑一个不在这个列表里的模式。',
 ].join('\n');
 
-const loadHostModule = (appPath, relativePath) => require(path.join(appPath, relativePath));
+// ---------------------------------------------------------------- credentials
 
-/* electron-store with the same projectName the host uses, so we read the very
- * same config.json. Falls back to reading the file directly when the module
- * cannot be resolved from the app directory. */
-const createSettingsStore = (appPath, app) => {
+const CREDENTIAL_KEY = 'aiCredential'; // { sealed: boolean, value: string }
+
+/* Electron is a public API surface in the main process (the mod's Node entry
+ * runs there); nothing host-private is touched. Resolved lazily so a mod that
+ * cannot see Electron still activates and reports the problem per request. */
+const electronOf = () => {
   try {
-    const StoreModule = loadHostModule(appPath, 'node_modules/electron-store');
-    const Store = StoreModule.default || StoreModule;
-    return new Store({ projectName: 'Folia' });
-  } catch (error) {
-    const fs = require('fs');
-    const configPath = path.join(app.getPath('appData'), 'Folia', 'config.json');
-    const read = () => {
-      try {
-        return JSON.parse(fs.readFileSync(configPath, 'utf8'));
-      } catch {
-        return {};
-      }
-    };
-    return { get: (key) => read()[key], store: read() };
+    return require('electron');
+  } catch {
+    return null;
   }
 };
 
-const readApiKeyPresence = (store) => {
-  const provider = store.get('AI_PROVIDER') || 'gemini';
-  const key = provider === 'openai' ? store.get('OPENAI_API_KEY') : store.get('GEMINI_API_KEY');
-  return { provider, configured: typeof key === 'string' && key.trim().length > 0 };
+const createCredentialStore = (api) => {
+  const electron = electronOf();
+  const safeStorage = electron?.safeStorage ?? null;
+
+  const canEncrypt = () => {
+    try {
+      return Boolean(safeStorage?.isEncryptionAvailable?.());
+    } catch {
+      return false;
+    }
+  };
+
+  const readRaw = async () => {
+    try {
+      const stored = await api.storage.data.get(CREDENTIAL_KEY);
+      return stored && typeof stored === 'object' ? stored : null;
+    } catch {
+      return null;
+    }
+  };
+
+  const statusOf = (stored) => {
+    const configured = Boolean(stored && typeof stored.value === 'string' && stored.value.length > 0);
+    return { configured, encrypted: configured && stored.sealed === true, canEncrypt: canEncrypt() };
+  };
+
+  return {
+    /** Stores a key the user just typed. Returns the new status. */
+    setKey: async (plain) => {
+      const text = typeof plain === 'string' ? plain.trim() : '';
+      if (!text) {
+        await api.storage.data.delete(CREDENTIAL_KEY);
+        return { configured: false, encrypted: false, canEncrypt: canEncrypt() };
+      }
+      if (canEncrypt()) {
+        const sealed = safeStorage.encryptString(text).toString('base64');
+        await api.storage.data.set(CREDENTIAL_KEY, { sealed: true, value: sealed });
+      } else {
+        // No OS keyring (Linux without libsecret/kwallet): the honest fallback is
+        // plaintext, and the settings panel says so out loud.
+        await api.storage.data.set(CREDENTIAL_KEY, { sealed: false, value: text });
+      }
+      return statusOf(await readRaw());
+    },
+
+    clear: async () => {
+      await api.storage.data.delete(CREDENTIAL_KEY);
+      return { configured: false, encrypted: false, canEncrypt: canEncrypt() };
+    },
+
+    /** The key in the clear, for one request. Never returned over IPC. */
+    getKey: async () => {
+      const stored = await readRaw();
+      if (!stored || typeof stored.value !== 'string' || !stored.value) return '';
+      if (stored.sealed !== true) return stored.value;
+      try {
+        return safeStorage.decryptString(Buffer.from(stored.value, 'base64'));
+      } catch (error) {
+        api.log.warn('本机无法解密已保存的密钥，请在模组设置里重新填写', { message: String(error?.message ?? error) });
+        return '';
+      }
+    },
+
+    status: async () => statusOf(await readRaw()),
+  };
 };
+
+// ---------------------------------------------------------------- transport
+
+/* Chromium's stack, so the user's system proxy setting applies (Node's global
+ * fetch would bypass it). */
+const httpFetchOf = () => {
+  const electron = electronOf();
+  if (typeof electron?.net?.fetch === 'function') return electron.net.fetch;
+  return typeof fetch === 'function' ? fetch : null;
+};
+
+/** `https://host`, `https://host/v1` and a full endpoint all end up at chat/completions. */
+const normalizeChatUrl = (raw) => {
+  let url = String(raw ?? '').trim();
+  if (!url) return null;
+  if (!/^https?:\/\//i.test(url)) url = `https://${url}`;
+  url = url.replace(/\/+$/, '');
+  if (/\/chat\/completions$/i.test(url)) return url;
+  if (/\/v\d+$/i.test(url)) return `${url}/chat/completions`;
+  return `${url}/v1/chat/completions`;
+};
+
+const extractContentText = (message) => {
+  if (!message) return '';
+  const content = message.content;
+  if (typeof content === 'string') return content;
+  // Some gateways answer with content parts instead of a string.
+  if (Array.isArray(content)) {
+    return content
+      .map((part) => (typeof part === 'string' ? part : part?.text ?? ''))
+      .filter(Boolean)
+      .join('');
+  }
+  return '';
+};
+
+const describeFailure = (error, timeoutMs) => {
+  const name = String(error?.name ?? '');
+  const message = String(error?.message ?? error);
+  if (name === 'AbortError' || /abort/i.test(message)) return `请求超时（${Math.round(timeoutMs / 1000)} 秒）`;
+  return message;
+};
+
+/*
+ * One request, with a small ladder for the quirks of OpenAI-compatible
+ * endpoints: `response_format` and `max_tokens` are both optional extensions, so
+ * a 4xx that is not an auth/limit error drops them one at a time instead of
+ * failing the whole decision.
+ */
+const requestCompletion = async ({ url, apiKey, model, temperature, systemPrompt, sourcePrompt, signal, log, isDisposed }) => {
+  const fetchImpl = httpFetchOf();
+  if (!fetchImpl) throw new Error('无法发起网络请求：Electron 的 net.fetch 与全局 fetch 都不可用。');
+
+  /* A deactivation aborts the same way a timeout does, so the two are told apart
+   * here rather than reported as "timeout" to a user who just switched the mod
+   * off. */
+  const failureOf = (error) => new Error(
+    isDisposed?.() ? '模组已停用' : describeFailure(error, REQUEST_TIMEOUT_MS),
+  );
+
+  const base = {
+    model,
+    messages: [
+      { role: 'system', content: systemPrompt },
+      { role: 'user', content: sourcePrompt },
+    ],
+    temperature,
+    stream: false,
+  };
+
+  const attempts = [
+    { ...base, response_format: { type: 'json_object' }, max_tokens: MAX_TOKENS },
+    { ...base, max_tokens: MAX_TOKENS },
+    { ...base },
+  ];
+
+  let lastError = null;
+  for (let index = 0; index < attempts.length; index += 1) {
+    let response;
+    try {
+      response = await fetchImpl(url, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${apiKey}`,
+        },
+        body: JSON.stringify(attempts[index]),
+        signal,
+      });
+    } catch (error) {
+      throw failureOf(error);
+    }
+
+    if (response.ok) {
+      let data;
+      try {
+        data = await response.json();
+      } catch (error) {
+        throw new Error(`AI 返回的不是合法 JSON：${describeFailure(error, REQUEST_TIMEOUT_MS)}`);
+      }
+      const text = extractContentText(data?.choices?.[0]?.message);
+      if (!text) {
+        const finish = data?.choices?.[0]?.finish_reason;
+        throw new Error(
+          finish === 'length'
+            ? 'AI 的回答被长度上限截断，没留下内容。请换一个更听话的模型。'
+            : 'AI 返回的内容是空的。',
+        );
+      }
+      return text;
+    }
+
+    const bodyText = await response.text().catch(() => '');
+    lastError = new Error(`接口返回 ${response.status}：${bodyText.slice(0, 300) || response.statusText}`);
+    // Only the two optional fields are worth retrying without; anything else is
+    // a real error the user has to see (bad key, wrong URL, rate limit...).
+    const retryable = index < attempts.length - 1 && response.status >= 400 && response.status < 500
+      && ![401, 403, 404, 429].includes(response.status);
+    if (!retryable) throw lastError;
+    log.warn(`接口拒绝了第 ${index + 1} 种请求形态，改用更保守的参数重试`, { status: response.status });
+  }
+  throw lastError ?? new Error('请求失败');
+};
+
+// ---------------------------------------------------------------- prompt
 
 const clipLine = (text) => {
   const flat = String(text ?? '').replace(/\s+/g, ' ').trim();
@@ -156,7 +327,7 @@ const buildSourcePrompt = ({ song, lyricsSnippet, modes, paramSpec, currentMode,
   }
 
   lines.push('', '可选模式：');
-  modes.forEach((mode) => {
+  (Array.isArray(modes) ? modes : []).forEach((mode) => {
     lines.push(`- ${mode.id}（${mode.label}）${mode.hint ? `：${mode.hint}` : ''}`);
   });
   // Every mode's parameter space, so the AI can tune whichever mode it picks
@@ -183,21 +354,49 @@ const extractJsonText = (raw) => {
   return text;
 };
 
-module.exports = function activate(api) {
-  api.rpc.handle('decide', async (payload) => {
-    const { app } = require('electron');
-    const appPath = app.getAppPath();
-    const store = createSettingsStore(appPath, app);
-    const { provider, configured } = readApiKeyPresence(store);
-    if (!configured) {
-      throw new Error(
-        provider === 'openai'
-          ? '还没配置 AI：请在「设置 → AI 主题设置 → 其他兼容接口」里填好接口链接、模型与密钥。'
-          : '还没配置 AI：请在「设置 → AI 主题设置」里填好 Gemini 密钥，或改用「其他兼容接口」。',
-      );
-    }
+const normalizeTemperature = (value) => {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric)) return 0.7;
+  return Math.min(2, Math.max(0, numeric));
+};
 
-    const { runAiJsonCompletion } = loadHostModule(appPath, 'electron/aiTextClient.cjs');
+// ---------------------------------------------------------------- activation
+
+module.exports = function activate(api) {
+  let disposed = false;
+  let inFlight = null; // AbortController of the request the AI is currently answering
+
+  /* Disabling the mod (or quitting) aborts whatever is still on the wire, so a
+   * late answer cannot be handed back to a renderer that is already gone. */
+  api.lifecycle.onDeactivate(() => {
+    disposed = true;
+    try {
+      inFlight?.abort();
+    } catch {
+      /* already settled */
+    }
+    inFlight = null;
+  });
+
+  const credentials = createCredentialStore(api);
+
+  api.rpc.handle('credential.status', () => credentials.status());
+  api.rpc.handle('credential.set', (payload) => credentials.setKey(payload?.key));
+  api.rpc.handle('credential.clear', () => credentials.clear());
+
+  api.rpc.handle('decide', async (payload) => {
+    if (disposed) throw new Error('模组已停用');
+
+    const config = payload?.config && typeof payload.config === 'object' ? payload.config : {};
+    const url = normalizeChatUrl(config.apiUrl);
+    if (!url) throw new Error('还没配置接口地址：请在「模组面板 → AI 歌词动画导演」里填写（例如 https://api.openai.com/v1）。');
+    const model = String(config.model ?? '').trim() || DEFAULT_MODEL;
+    const temperature = normalizeTemperature(config.temperature);
+
+    const apiKey = await credentials.getKey();
+    if (!apiKey) {
+      throw new Error('还没配置密钥：请在「模组面板 → AI 歌词动画导演」里填写这个接口的 API 密钥（只保存在本机，加密存放）。');
+    }
 
     const systemPrompt = payload?.userHint
       ? `${SYSTEM_PROMPT}\n\n用户额外要求（优先满足）：${clipLine(payload.userHint)}`
@@ -215,17 +414,28 @@ module.exports = function activate(api) {
         : null,
     });
 
-    api.log.info(`请求 AI 决策（${provider}，${Array.isArray(payload?.modes) ? payload.modes.length : 0} 个模式）`);
+    api.log.info(`请求 AI 决策（${model}，${Array.isArray(payload?.modes) ? payload.modes.length : 0} 个模式）`);
 
-    const raw = await runAiJsonCompletion({
-      store,
-      systemPrompt,
-      sourcePrompt,
-      schema: DECISION_SCHEMA,
-      schemaName: 'lyric_animation_decision',
-      customFetch: (url, init) => fetch(url, init),
-      maxTokens: 2048,
-    });
+    const controller = new AbortController();
+    inFlight = controller;
+    const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+    let raw;
+    try {
+      raw = await requestCompletion({
+        url,
+        apiKey,
+        model,
+        temperature,
+        systemPrompt,
+        sourcePrompt,
+        signal: controller.signal,
+        log: api.log,
+        isDisposed: () => disposed,
+      });
+    } finally {
+      clearTimeout(timer);
+      if (inFlight === controller) inFlight = null;
+    }
 
     let parsed;
     try {
@@ -245,5 +455,5 @@ module.exports = function activate(api) {
     };
   });
 
-  api.log.info('AI 歌词动画导演：main 入口就绪');
+  api.log.info('AI 歌词动画导演：main 入口就绪（模组自有密钥，Electron net.fetch 传输）');
 };
