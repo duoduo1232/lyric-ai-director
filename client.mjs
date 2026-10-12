@@ -263,6 +263,10 @@ const REASON_MAX_CHARS = 200;
 const QUEUED = Symbol('queued');
 const STALE = Symbol('stale');
 const DISPOSED = Symbol('disposed');
+/* Nothing is playing (the host emits `playback.songChanged` with `song: null` when
+ * playback stops or hands off to the stage window): there is no song to judge, so
+ * no request is sent and no answer is applied. */
+const NO_SONG = Symbol('no-song');
 
 /* `folium.internals` is a gated proxy: in the export window (or without a
  * `folia` range) reading it throws instead of returning undefined, and optional
@@ -524,30 +528,66 @@ const applyDecision = (folium, decision, { applyParams = true } = {}) => {
   const currentTuning = tuningKey ? state[tuningKey] : null;
 
   /* A value behind a closed switch changes nothing on screen, so open the gate in
-   * the same write. A switch the AI spoke about itself is left alone, and a value
-   * that asks for less (off / zero) needs no gate at all. */
+   * the same write — but only when opening it actually unblocks the value. A key
+   * can depend on several switches (sonnet's mgDensity needs showBackgroundMg on
+   * *and* showOnlyText off); injecting one of them while the AI explicitly set
+   * another to a blocking value would change a switch the AI never asked about
+   * and still not show the value. In that case nothing is injected and the value
+   * is reported as blocked. A switch the AI spoke about itself is never
+   * overridden, and a value that asks for less (off / zero) needs no gate. */
+  const requested = Object.keys(patch); // what the AI actually asked for
   const openedFor = new Set();
-  Object.keys(patch).forEach((key) => {
+  requested.forEach((key) => {
     if (isInertValue(spec.params[key], patch[key])) return;
-    gatesFor(mode, key).forEach((gate) => {
-      if (gate.key in patch) return;
-      if (gateSatisfied(currentTuning, gate)) return;
-      patch[gate.key] = gate.setTo ?? gate.mustBe;
-      openedFor.add(key);
-    });
+    const gates = gatesFor(mode, key);
+    if (gates.length === 0) return;
+    // Already satisfied once the AI's own patch is in place?
+    const preview = { ...(currentTuning ?? {}), ...patch };
+    if (gates.every((gate) => gateSatisfied(preview, gate))) return;
+    // Every unsatisfied gate must be one we are allowed to set ourselves.
+    const injectable = gates.filter((gate) => !gateSatisfied(preview, gate));
+    if (injectable.some((gate) => gate.key in patch)) return; // the AI decided this switch
+    const trial = { ...preview };
+    injectable.forEach((gate) => { trial[gate.key] = gate.setTo ?? gate.mustBe; });
+    if (!gates.every((gate) => gateSatisfied(trial, gate))) return; // opening it would not help
+    injectable.forEach((gate) => { patch[gate.key] = gate.setTo ?? gate.mustBe; });
+    openedFor.add(key);
   });
   state[spec.setter](patch);
 
-  const finalTuning = { ...(currentTuning ?? {}), ...patch };
-  Object.keys(patch).forEach((key) => {
+  /* Read the values back instead of trusting the request: the host's setters are
+   * not a plain merge. Cappella rewrites `emojiPackSource:'custom'` to 'builtin'
+   * when no pack is uploaded (useVisualizerSettingsStore.ts:538-540) and partita
+   * sorts staggerMin/staggerMax (:330-331), so reporting the request would claim a
+   * value that is not in the store — and would also judge "blocked" from the wrong
+   * state. */
+  /* Read the values back from a FRESH state: the host's setters call the store's
+   * own `set`, which replaces the state object, so the snapshot taken above still
+   * holds the old tuning. */
+  const afterState = visualizerSettings.getState?.() ?? state;
+  const storedTuning = tuningKey && afterState?.[tuningKey] && typeof afterState[tuningKey] === 'object'
+    ? afterState[tuningKey]
+    : null;
+  const actualValueOf = (key) => (
+    storedTuning && key in storedTuning ? storedTuning[key] : patch[key]
+  );
+  const finalTuning = { ...(currentTuning ?? {}), ...patch, ...(storedTuning ?? {}) };
+  // Report only what the AI asked for: a switch this mod opened on its own is
+  // named in the suffix of the value that needed it, never as its own "the AI
+  // chose this" line.
+  requested.forEach((key) => {
     const zh = spec.params[key]?.zh ?? key;
     // Honest reporting: never claim an effect the final state still blocks. A
     // value that only asks for less cannot be blocked — it is a no-op by design.
     const inert = isInertValue(spec.params[key], patch[key]);
     const blocked = !inert && gatesFor(mode, key).some((gate) => !gateSatisfied(finalTuning, gate));
+    const actual = actualValueOf(key);
+    // The host moved the value (cappella's pack source, partita's stagger order):
+    // say so instead of reporting a number the store does not hold.
+    const rewritten = storedTuning !== null && key in storedTuning && storedTuning[key] !== patch[key];
     const suffix = blocked ? '（被开关挡住，未生效）'
       : openedFor.has(key) ? '（已同时打开所需开关）' : '';
-    applied.push(`${zh}→${formatValue(patch[key])}${suffix}`);
+    applied.push(`${zh}→${formatValue(actual)}${suffix}${rewritten ? '（宿主已按可用资源调整）' : ''}`);
   });
   return { mode, applied };
 };
@@ -592,19 +632,37 @@ const currentSongOf = (folium) => songInfoOf(displaySongOf(playbackStateOf(foliu
 const currentLinesOf = (folium) => lyricLinesOf(displayLyricsOf(playbackStateOf(folium)));
 
 /* Song identity for the per-song memory. Mirrors the host's own
- * getPlaybackSongKey (src/utils/appPlaybackGuards.ts): source kind + media id, so
- * a local file and an online track with the same title never share an entry. */
+ * getPlaybackSourceRef + getPlaybackSongKey (src/utils/appPlaybackGuards.ts):
+ * an explicit `sourceRef` wins, otherwise the song is classified the same way the
+ * host does (stage / local / navidrome / online). The classification matters:
+ * a queue entry usually has no `sourceRef` yet, while the same song carries one
+ * once it plays — guessing "online" for a Navidrome or cloud track would file the
+ * prefetched decision under a key the playing song never looks up, so the entry
+ * would be lost and the song would be decided twice. */
 const songKeyOf = (song) => {
   if (!song || typeof song !== 'object') return null;
-  const sourceRef = song.sourceRef;
-  if (sourceRef && typeof sourceRef === 'object') {
-    if (sourceRef.kind === 'online') {
-      return `online:${sourceRef.providerId ?? 'netease'}:${sourceRef.mediaId ?? song.id}`;
-    }
-    if (sourceRef.kind && sourceRef.mediaId !== undefined) return `${sourceRef.kind}:${sourceRef.mediaId}`;
+  const ref = song.sourceRef && typeof song.sourceRef === 'object' ? song.sourceRef : null;
+  if (ref && ref.kind) {
+    return ref.kind === 'online'
+      ? `online:${ref.providerId ?? 'netease'}:${ref.mediaId ?? song.id}`
+      : `${ref.kind}:${ref.mediaId ?? song.id}`;
   }
-  if (song.localRef?.songId) return `local:${song.localRef.songId}`;
+  // No sourceRef: classify exactly like getPlaybackSourceRef.
   if (song.isStage === true) return `stage:${song.id}`;
+  if (song.localRef?.songId) return `local:${song.localRef.songId}`;
+  /* Mirrors resolveNavidromePlaybackCarrier (src/utils/appPlaybackGuards.ts:13-33)
+   * rather than guessing a shape: the host only treats a song as Navidrome when
+   * `navidromeData` is itself a Navidrome carrier (`isNavidrome === true`) or when
+   * the song itself is one. `navidromeCarrier` is not a host field at all, and an
+   * id read from the wrong level would file the prefetched entry under a key the
+   * playing song never looks up. */
+  const navidromeCarrier = song.navidromeData && song.navidromeData.isNavidrome === true
+    ? song.navidromeData
+    : (song.isNavidrome === true && song.navidromeData ? song : null);
+  if (navidromeCarrier) {
+    const navidromeId = navidromeCarrier.navidromeData?.id ?? song.id;
+    if (navidromeId !== undefined && navidromeId !== null) return `navidrome:${navidromeId}`;
+  }
   if (song.id !== undefined && song.id !== null) return `online:${song.providerId ?? 'netease'}:${song.id}`;
   // Last resort for a song DTO without any id: title + artist, normalised.
   const title = String(song.name ?? '').trim().toLowerCase();
@@ -632,6 +690,9 @@ export default function activate(folium) {
    *  re-scheduled instead of being dropped (that drop was why some tracks never
    *  got a decision at all). */
   let pendingSongKey = null;
+  /** Whether the queued request was a forced re-decide, so it is not silently
+   *  downgraded to "reuse this song's memory" when it finally runs. */
+  let pendingForce = false;
   /** Song key already pre-decided while waiting in the queue, so the same track
    *  is not prefetched twice before it starts playing. */
   let prefetchedSongKey = null;
@@ -725,13 +786,21 @@ export default function activate(folium) {
     } catch (error) {
       // The cap is enforced by the host; drop the oldest third and try once more
       // rather than letting the memory go silently dead for the rest of the run.
+      // The index is newest-first, so the oldest entries are its *tail*.
       folium.log.warn('写入这首歌的记忆失败，清理旧记录后重试', error);
       try {
         const index = await readMemoryIndex();
-        const drop = index.slice(Math.floor(index.length / 3));
-        for (const old of drop) await folium.storage.delete(memoryKeyOf(old));
-        await folium.storage.set(MEMORY_INDEX_KEY, index.slice(0, Math.floor(index.length / 3)));
+        const dropCount = Math.max(1, Math.floor(index.length / 3));
+        const dropped = index.slice(index.length - dropCount);
+        const kept = index.slice(0, index.length - dropCount);
+        for (const old of dropped) await folium.storage.delete(memoryKeyOf(old));
+        await folium.storage.set(MEMORY_INDEX_KEY, kept);
         await folium.storage.set(memoryKeyOf(songKey), entry);
+        // Re-enter the LRU index at the front: the entry was written outside
+        // touchMemoryIndex, so without this it would never be reordered again and
+        // could not be evicted when the memory fills up.
+        await touchMemoryIndex(songKey);
+        if (dropped.length > 0) folium.log.info(`记忆写入超限，清理了最旧的 ${dropped.length} 首歌的旧记录`);
       } catch (retryError) {
         folium.log.warn('清理后仍然写入失败，这次决策不会记住', retryError);
       }
@@ -772,6 +841,9 @@ export default function activate(folium) {
     }
   };
 
+  /* Guarded like the decision path: this awaits storage, so the mod can be switched
+   * off in the middle of it. Writing the host's persisted visualizer settings after
+   * teardown would change the player for a mod that is no longer running. */
   const restoreSettings = async () => {
     if (!canRemember()) return '无法访问模组存储，无法恢复。';
     let snapshot = null;
@@ -780,6 +852,7 @@ export default function activate(folium) {
     } catch (error) {
       folium.log.warn('读取设置快照失败', error);
     }
+    if (disposed) return '模组已停用。';
     if (!snapshot || typeof snapshot !== 'object') return '还没有可恢复的快照：这个模组还没改过你的动画设置。';
     const state = settingsStore(folium)?.getState?.();
     if (!state) return '宿主内部接口不可用，无法恢复。';
@@ -841,8 +914,11 @@ export default function activate(folium) {
    * never comes back to this side. */
   const DEFAULT_API_URL = 'https://api.openai.com/v1';
   const DEFAULT_MODEL = 'gpt-4o-mini';
-  let credential = { configured: false, encrypted: false, canEncrypt: false };
+  let credential = { configured: false, encrypted: false, canEncrypt: false, undecryptable: false };
   let credentialKnown = false;
+  /** The settings panel's own redraw functions, so a credential status refresh
+   *  reaches the panel that is showing it (see refreshCredential). */
+  const panelRefreshers = new Set();
 
   const refreshCredential = async () => {
     try {
@@ -851,18 +927,34 @@ export default function activate(folium) {
         configured: status?.configured === true,
         encrypted: status?.encrypted === true,
         canEncrypt: status?.canEncrypt === true,
+        undecryptable: status?.undecryptable === true,
       };
       credentialKnown = true;
     } catch (error) {
       credentialKnown = true;
-      credential = { configured: false, encrypted: false, canEncrypt: false };
+      credential = { configured: false, encrypted: false, canEncrypt: false, undecryptable: false };
       folium.log.warn('读取密钥状态失败', error);
     }
     notify();
+    /* `notify` refreshes the player tab's own render only; the settings panel keeps
+     * its own `render` and would otherwise show "密钥：检查中…" until the user touched
+     * some unrelated setting. Registered here (and cleared on teardown) so a status
+     * refresh redraws the panel that asked for it. */
+    panelRefreshers.forEach((refresh) => {
+      try {
+        refresh();
+      } catch (error) {
+        folium.log.warn('刷新模组设置面板失败', error);
+      }
+    });
   };
 
   const credentialLine = () => {
     if (!credentialKnown) return '密钥：检查中…';
+    /* A stored value that cannot be opened on this machine (copied mod-data.json,
+     * or a session without the keyring it was sealed in) is not "saved": saying so
+     * would promise a working key while every request fails. */
+    if (credential.undecryptable) return '密钥：已保存但本机无法解密，请重新填写';
     if (!credential.configured) return '密钥：还没填写';
     return credential.encrypted ? '密钥：已保存（系统加密）' : '密钥：已保存（明文，本机没有可用的加密后端）';
   };
@@ -998,27 +1090,66 @@ export default function activate(folium) {
         return el;
       };
 
-      const toggle = (label, hint, key) => {
-        const box = document.createElement('input');
-        box.type = 'checkbox';
-        box.checked = params.get()[key] === true;
-        box.addEventListener('change', () => params.set({ [key]: box.checked }));
-        const line = document.createElement('label');
-        line.style.cssText = 'display:flex;gap:8px;align-items:flex-start;';
-        line.appendChild(box);
-        const text = document.createElement('span');
-        const strong = document.createElement('span');
-        strong.textContent = label;
-        strong.style.cssText = 'font-weight:600;display:block;';
-        text.appendChild(strong);
-        if (hint) {
-          const note = document.createElement('span');
-          note.textContent = hint;
-          note.style.cssText = 'opacity:0.6;font-size:12px;';
-          text.appendChild(note);
+      /* One schema field, drawn by its declared type. Every field the schema
+       * declares must be reachable here: a custom panel REPLACES the host's
+       * automatic form, so anything not drawn is unreachable, and drawing a
+       * `text` field as a checkbox would write a boolean the host's own
+       * validation drops (the value could never be set at all). */
+      const schemaField = (item) => {
+        const label = String(item.label?.['zh-CN'] ?? item.label?.en ?? item.key);
+        const hint = String(item.description?.['zh-CN'] ?? item.description?.en ?? '');
+        const value = params.get()[item.key];
+        if (item.type === 'boolean') {
+          const box = document.createElement('input');
+          box.type = 'checkbox';
+          box.checked = value === true;
+          box.addEventListener('change', () => params.set({ [item.key]: box.checked }));
+          const line = document.createElement('label');
+          line.style.cssText = 'display:flex;gap:8px;align-items:flex-start;';
+          line.appendChild(box);
+          const text = document.createElement('span');
+          const strong = document.createElement('span');
+          strong.textContent = label;
+          strong.style.cssText = 'font-weight:600;display:block;';
+          text.appendChild(strong);
+          if (hint) {
+            const note = document.createElement('span');
+            note.textContent = hint;
+            note.style.cssText = 'opacity:0.6;font-size:12px;';
+            text.appendChild(note);
+          }
+          line.appendChild(text);
+          return line;
         }
-        line.appendChild(text);
-        return line;
+        if (item.type === 'select') {
+          const el = document.createElement('select');
+          el.style.cssText = [
+            'padding:6px 8px', 'border-radius:8px', 'font-size:13px',
+            'border:1px solid var(--folium-border,rgba(128,128,128,0.45))',
+            'background:var(--folium-input-bg,transparent)', 'color:inherit', 'width:100%',
+          ].join(';');
+          (item.options ?? []).forEach((option) => {
+            const choice = document.createElement('option');
+            choice.value = String(option.value);
+            choice.textContent = String(option.label?.['zh-CN'] ?? option.label?.en ?? option.value);
+            el.appendChild(choice);
+          });
+          el.value = String(value ?? '');
+          el.addEventListener('change', () => params.set({ [item.key]: el.value }));
+          return field(label, hint, el);
+        }
+        if (item.type === 'number') {
+          const el = input(String(value ?? 0), 'number');
+          if (item.min !== undefined) el.min = String(item.min);
+          if (item.max !== undefined) el.max = String(item.max);
+          if (item.step !== undefined) el.step = String(item.step);
+          el.addEventListener('change', () => params.set({ [item.key]: Number(el.value) }));
+          return field(label, hint, el);
+        }
+        const el = input(String(value ?? ''));
+        if (item.placeholder) el.placeholder = String(item.placeholder);
+        el.addEventListener('change', () => params.set({ [item.key]: el.value }));
+        return field(label, hint, el);
       };
 
       const button = (label, primary) => {
@@ -1095,19 +1226,30 @@ export default function activate(folium) {
         keyRow.style.cssText = 'display:flex;gap:8px;flex-wrap:wrap;';
         const saveKey = button('保存密钥', true);
         saveKey.addEventListener('click', async () => {
+          /* The placeholder promises that an empty box keeps the stored key, and
+           * "清除密钥" is the button that removes it. Sending '' here would delete a
+           * working credential and still report success. */
+          if (!draftKey.trim()) {
+            keyNote = credential.configured
+              ? '没有填写新密钥，已保存的密钥保持不变（要删除请点「清除密钥」）。'
+              : '还没有填写密钥。';
+            render();
+            return;
+          }
           saveKey.disabled = true;
           keyNote = '正在保存…';
           render();
           try {
-            const status = await folium.rpc.call('credential.set', { key: draftKey });
+            const status = await folium.rpc.call('credential.set', { key: draftKey.trim() });
             credential = {
               configured: status?.configured === true,
               encrypted: status?.encrypted === true,
               canEncrypt: status?.canEncrypt === true,
+              undecryptable: status?.undecryptable === true,
             };
             credentialKnown = true;
             draftKey = '';
-            keyNote = credential.configured ? '密钥已保存。' : '密钥已清除。';
+            keyNote = credential.configured ? '密钥已保存。' : '密钥没有保存成功。';
             folium.ui.toast('AI 导演：密钥已更新', { type: 'success' });
           } catch (error) {
             keyNote = `保存失败：${String(error?.message ?? error)}`;
@@ -1121,7 +1263,7 @@ export default function activate(folium) {
           clearKey.disabled = true;
           try {
             await folium.rpc.call('credential.clear');
-            credential = { configured: false, encrypted: false, canEncrypt: credential.canEncrypt };
+            credential = { configured: false, encrypted: false, canEncrypt: credential.canEncrypt, undecryptable: false };
             draftKey = '';
             keyNote = '密钥已清除。';
           } catch (error) {
@@ -1140,13 +1282,7 @@ export default function activate(folium) {
         const schema = params.schema ?? [];
         schema
           .filter((item) => item.group && item.key !== 'apiUrl' && item.key !== 'model' && item.key !== 'temperature')
-          .forEach((item) => {
-            behaviour.appendChild(toggle(
-              String(item.label?.['zh-CN'] ?? item.label?.en ?? item.key),
-              String(item.description?.['zh-CN'] ?? item.description?.en ?? ''),
-              item.key,
-            ));
-          });
+          .forEach((item) => behaviour.appendChild(schemaField(item)));
         root.appendChild(behaviour);
 
         // --- escape hatch ---
@@ -1170,8 +1306,12 @@ export default function activate(folium) {
 
       render();
       const unsubscribe = params.subscribe(() => render());
+      panelRefreshers.add(render);
       void refreshCredential();
-      return () => unsubscribe?.();
+      return () => {
+        panelRefreshers.delete(render);
+        unsubscribe?.();
+      };
     },
   });
 
@@ -1231,12 +1371,30 @@ export default function activate(folium) {
   const runDecision = async ({ announce = true, force = false } = {}) => {
     if (disposed) return DISPOSED;
     const settings = readSettings();
+    /* Nothing is on screen: the host emits `playback.songChanged` with `song: null`
+     * when playback stops or hands off to the stage window (hostEvents.ts:79-83).
+     * Deciding then would send "(未知曲目)" to the AI, spend a call and paint the
+     * answer onto whatever plays next.
+     *
+     * No playback *state* at all is a different problem: the host's internals are
+     * unavailable (mod.json range, older host), and telling the user "no song is
+     * playing" would send them looking for a track instead of at the setting. */
     const songKey = currentSongKey(folium);
+    if (!songKey || !currentSongOf(folium)) {
+      if (!settingsStore(folium)) {
+        lastSummary = '失败：无法访问歌词动画设置：宿主内部接口不可用。请确认 mod.json 声明了 folia 版本范围并重启应用。';
+        lastReason = '';
+        folium.log.error('宿主内部接口不可用，无法决策');
+        if (announce) folium.ui.toast(`AI 导演失败：${lastSummary.slice(3)}`, { type: 'error' });
+        return lastSummary;
+      }
+      return NO_SONG;
+    }
 
     // A stored decision is applied without asking the AI again. Wrapped like the
     // network path so a broken internals state degrades to a message instead of
     // throwing out of the command.
-    if (!force && settings.remember && songKey) {
+    if (!force && settings.remember) {
       const remembered = await readMemory(songKey);
       if (disposed) return DISPOSED;
       /* The lookup is an await too: a fast skip can move the player to another
@@ -1251,6 +1409,10 @@ export default function activate(folium) {
           lastSummary = `${result.applied.length > 0 ? result.applied.join('，') : '没有需要改动的地方'}（沿用这首歌上次的选择）`;
           const text = `${lastSummary}${lastReason ? `（${lastReason}）` : ''}`;
           if (announce) folium.ui.toast(`AI 导演：${text}`, { type: 'info' });
+          /* This path returns before the main `finally` below, so the prefetch has
+           * to be started here as well — otherwise it would never run for a
+           * remembered song, which is exactly the songs that get replayed. */
+          if (!disposed) void prefetchNextSong();
           return text;
         } catch (error) {
           // The stored pick cannot be applied (host interface unavailable): fall
@@ -1261,23 +1423,34 @@ export default function activate(folium) {
     }
     if (disposed) return DISPOSED;
 
+    /* The memory lookup above is an await as well: a skip during it moved the
+     * player to another track. Everything from here on has to describe the song
+     * that is on screen *now* — capturing the earlier key made the request use the
+     * new song's lyrics while `inFlightSongKey` still held the old one, so the
+     * answer was filed under the wrong song and reported as STALE. */
+    const liveKey = currentSongKey(folium);
+    if (!liveKey || !currentSongOf(folium)) return NO_SONG;
+
     /* A decision is already running. Rather than dropping this request (which is
      * how a track ended up with no decision at all), remember the song that asked
-     * and re-run once the current one settles. */
+     * and re-run once the current one settles. `force` travels with it: a
+     * "重新决策" clicked while another decision runs must not come back as "沿用这
+     * 首歌上次的选择". */
     if (busy) {
-      pendingSongKey = songKey;
+      pendingSongKey = liveKey;
+      pendingForce = pendingForce || force;
       return QUEUED;
     }
 
     busy = true;
-    inFlightSongKey = songKey;
+    inFlightSongKey = liveKey;
     notify();
     const { applyParams } = settings;
     try {
       const decision = await requestDecision({
         song: currentSongOf(folium),
         lines: currentLinesOf(folium),
-        targetSongKey: songKey,
+        targetSongKey: liveKey,
         force,
       });
       if (disposed) return DISPOSED;
@@ -1288,8 +1461,17 @@ export default function activate(folium) {
       const nowKey = currentSongKey(folium);
       if (nowKey !== inFlightSongKey) {
         if (settings.remember && inFlightSongKey) {
-          const settled = sanitizeDecision(folium, decision, currentMode(settingsStore(folium)));
-          await writeMemory(inFlightSongKey, settled);
+          /* The fallback mode must NOT come from the store here: the track on
+           * screen is a different one, so its mode describes the wrong song. An
+           * id that is not in the live registry is dropped instead of being
+           * remembered as whatever the new song happens to be playing. */
+          const candidate = typeof decision?.mode === 'string' ? decision.mode.trim() : '';
+          const known = availableModes(folium).some((item) => item.id === candidate);
+          if (known) {
+            await writeMemory(inFlightSongKey, sanitizeDecision(folium, decision, candidate));
+          } else {
+            folium.log.warn(`决策返回时已换歌，且模式「${candidate}」不存在，这条结果不写入记忆`);
+          }
         }
         folium.log.info('决策返回时已换歌，结果记入那首歌的记忆');
         return STALE;
@@ -1311,8 +1493,8 @@ export default function activate(folium) {
        * "(这首歌没有歌词)". Remembering that would freeze a guess forever, so the
        * decision is applied but not stored. */
       const hadLyrics = currentLinesOf(folium).length > 0;
-      if (settings.remember && songKey && hadLyrics) await writeMemory(songKey, applied);
-      else if (settings.remember && songKey) folium.log.info('这首歌没有歌词，本次决策不写入记忆');
+      if (settings.remember && inFlightSongKey && hadLyrics) await writeMemory(inFlightSongKey, applied);
+      else if (settings.remember && inFlightSongKey) folium.log.info('这首歌没有歌词，本次决策不写入记忆');
       await noteRecentMode(result.mode);
       const text = `${lastSummary}${lastReason ? `（${lastReason}）` : ''}`;
       if (announce) folium.ui.toast(`AI 导演：${text}`, { type: 'success' });
@@ -1336,12 +1518,15 @@ export default function activate(folium) {
         // A song asked while this one was running: give it its turn now.
         if (pendingSongKey !== null) {
           const queued = pendingSongKey;
+          const queuedForce = pendingForce;
           pendingSongKey = null;
-          if (queued === currentSongKey(folium)) void runDecision({ announce: true });
+          pendingForce = false;
+          if (queued === currentSongKey(folium)) {
+            void runDecision({ announce: true, force: queuedForce });
+          }
         } else {
           // Nothing else waiting: use the idle moment to prepare the next track, so
-          // it can start with its own animation already in place. Reached on every
-          // path that did not queue anything — a memory hit included.
+          // it can start with its own animation already in place.
           void prefetchNextSong();
         }
       }
@@ -1402,6 +1587,11 @@ export default function activate(folium) {
     if (!song) return;
     const key = songKeyOf(song);
     if (!key || key === prefetchedSongKey) return;
+    /* `nextQueuedSong` falls back to `queue[0]` when the song on screen is not in
+     * the queue (the queue was replaced, or the track is not from it), and that
+     * entry can be the track that is already playing. Preparing it would spend an
+     * AI call on a song that is on screen and then discard the answer, so skip it. */
+    if (key === songKeyOf(displaySongOf(state))) return;
     if (!settings.remember) return; // nowhere to park the answer
     if (await readMemory(key)) {
       prefetchedSongKey = key; // already known: nothing to do
@@ -1416,7 +1606,15 @@ export default function activate(folium) {
       const result = await omni.getLyrics(song);
       if (disposed) return;
       const lines = lyricLinesOf(result?.lyrics);
-      if (lines.length === 0 && !result?.isPureMusic) return; // nothing to judge by
+      /* Nothing to judge by. The guard is released so a later attempt (when the
+       * provider does have lyrics for this track) is not blocked until the next
+       * song change. A pure-music track stays skipped: there is no lyric to decide
+       * from, and the README promises such tracks are not remembered. */
+      if (lines.length === 0) {
+        prefetchedSongKey = null;
+        if (!result?.isPureMusic) folium.log.info(`「${songInfoOf(song)?.title}」暂时取不到歌词，稍后再试`);
+        return;
+      }
       // The track may have started (or been skipped) while the provider answered.
       // Compared against the display song, like every other "what is on screen"
       // decision in this file.
@@ -1436,8 +1634,17 @@ export default function activate(folium) {
       if (busy || songKeyOf(displaySongOf(playbackStateOf(folium))) === key) return;
       /* Same validation as the on-screen path: a mode that is not in the live
        * registry must never be stored, or the prefetched entry would apply a
-       * hallucinated pick the next time the track starts. */
-      const settled = sanitizeDecision(folium, decision, currentMode(settingsStore(folium)));
+       * hallucinated pick the next time the track starts. Unlike the stale path,
+       * the mode on screen is NOT a valid fallback here — it belongs to a different
+       * song, so the entry is dropped instead of freezing that song under the
+       * previous track's animation. */
+      const candidate = typeof decision?.mode === 'string' ? decision.mode.trim() : '';
+      const known = availableModes(folium).some((item) => item.id === candidate);
+      if (!known) {
+        folium.log.warn(`提前决策返回的模式「${candidate}」不存在，这条结果不写入记忆`);
+        return;
+      }
+      const settled = sanitizeDecision(folium, decision, candidate);
       const existing = await readMemory(key);
       if (disposed) return;
       if (existing && existing.at > 0) return; // a newer answer is already there
@@ -1460,6 +1667,7 @@ export default function activate(folium) {
     run: async () => {
       const text = await runDecision({ announce: true });
       if (text === DISPOSED) return '模组已停用。';
+      if (text === NO_SONG) return '现在没有正在播放的歌，先播放一首再来。';
       if (text === QUEUED) return '上一次决策还在进行中，这首歌已排队，稍候会自动完成。';
       if (text === STALE) return '决策返回时你已经切到了别的歌，这条结果记在了那首歌上。';
       return text.startsWith('失败：') ? text : `已应用：${text}`;
@@ -1595,7 +1803,15 @@ export default function activate(folium) {
     if (disposed) return;
     if (!readSettings().auto) return;
     if (lyricsTimer !== null) clearTimeout(lyricsTimer);
+    /* Nothing on screen (the host emits `playback.songChanged` with `song: null`
+     * when playback stops or hands off to the stage window): there is nothing to
+     * decide, so no timer is armed. */
     const key = currentSongKey(folium);
+    if (!key || !currentSongOf(folium)) {
+      lyricsTimer = null;
+      awaitingLyricsSongKey = null;
+      return;
+    }
     const decide = () => {
       lyricsTimer = null;
       awaitingLyricsSongKey = null;

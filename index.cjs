@@ -92,19 +92,38 @@ const createCredentialStore = (api) => {
     }
   };
 
+  /* Whether a sealed value can actually be opened *on this machine*. A copied
+   * mod-data.json, or a Linux session without the keyring it was sealed in, leaves
+   * a value that is present but useless; reporting it as "configured" made every
+   * request fail with "还没配置密钥" while the panel claimed the key was saved. */
+  const canDecrypt = (stored) => {
+    if (stored?.sealed !== true) return true;
+    try {
+      return safeStorage.decryptString(Buffer.from(stored.value, 'base64')).length > 0;
+    } catch {
+      return false;
+    }
+  };
+
   const statusOf = (stored) => {
-    const configured = Boolean(stored && typeof stored.value === 'string' && stored.value.length > 0);
-    return { configured, encrypted: configured && stored.sealed === true, canEncrypt: canEncrypt() };
+    const stored_ = Boolean(stored && typeof stored.value === 'string' && stored.value.length > 0);
+    const usable = stored_ && canDecrypt(stored);
+    return {
+      configured: usable,
+      encrypted: usable && stored.sealed === true,
+      canEncrypt: canEncrypt(),
+      undecryptable: stored_ && !usable,
+    };
   };
 
   return {
     /** Stores a key the user just typed. Returns the new status. */
     setKey: async (plain) => {
       const text = typeof plain === 'string' ? plain.trim() : '';
-      if (!text) {
-        await api.storage.data.delete(CREDENTIAL_KEY);
-        return { configured: false, encrypted: false, canEncrypt: canEncrypt() };
-      }
+      /* An empty payload is a no-op, never a delete: the panel's placeholder
+       * promises that leaving the box blank keeps the stored key, and only the
+       * "清除密钥" button (credential.clear) removes it. */
+      if (!text) return statusOf(await readRaw());
       if (canEncrypt()) {
         const sealed = safeStorage.encryptString(text).toString('base64');
         await api.storage.data.set(CREDENTIAL_KEY, { sealed: true, value: sealed });
@@ -118,7 +137,7 @@ const createCredentialStore = (api) => {
 
     clear: async () => {
       await api.storage.data.delete(CREDENTIAL_KEY);
-      return { configured: false, encrypted: false, canEncrypt: canEncrypt() };
+      return { configured: false, encrypted: false, canEncrypt: canEncrypt(), undecryptable: false };
     },
 
     /** The key in the clear, for one request. Never returned over IPC. */
@@ -153,10 +172,16 @@ const normalizeChatUrl = (raw) => {
   let url = String(raw ?? '').trim();
   if (!url) return null;
   if (!/^https?:\/\//i.test(url)) url = `https://${url}`;
-  url = url.replace(/\/+$/, '');
-  if (/\/chat\/completions$/i.test(url)) return url;
-  if (/\/v\d+$/i.test(url)) return `${url}/chat/completions`;
-  return `${url}/v1/chat/completions`;
+  /* Split the query/fragment off first: appending to the whole string turned
+   * `https://host/v1?api-version=x` into `...?api-version=x/v1/chat/completions`
+   * (common for Azure-style or proxied gateways). */
+  const cut = url.search(/[?#]/);
+  const suffix = cut === -1 ? '' : url.slice(cut);
+  let path = (cut === -1 ? url : url.slice(0, cut)).replace(/\/+$/, '');
+  if (!/\/chat\/completions$/i.test(path)) {
+    path = /\/v\d+$/i.test(path) ? `${path}/chat/completions` : `${path}/v1/chat/completions`;
+  }
+  return `${path}${suffix}`;
 };
 
 const extractContentText = (message) => {
@@ -250,7 +275,15 @@ const requestCompletion = async ({ url, apiKey, model, temperature, systemPrompt
     }
 
     const bodyText = await response.text().catch(() => '');
-    lastError = new Error(`接口返回 ${response.status}：${bodyText.slice(0, 300) || response.statusText}`);
+    /* The provider's error body is shown to the user, so it must not be able to
+     * echo the credential back. Gateways do sometimes repeat request headers in
+     * an error payload; strip the key (and any Bearer token) before it reaches a
+     * message, a toast or the log. */
+    const redact = (text) => String(text)
+      .split(apiKey).join('[已隐藏]')
+      .replace(/(Bearer\s+)[A-Za-z0-9._~+\/-]{8,}/gi, '$1[已隐藏]')
+      .replace(/("?(?:api[_-]?key|authorization|token)"?\s*[:=]\s*"?)[^"\s,}]{8,}/gi, '$1[已隐藏]');
+    lastError = new Error(`接口返回 ${response.status}：${redact(bodyText).slice(0, 300) || response.statusText}`);
     // Only the two optional fields are worth retrying without; anything else is
     // a real error the user has to see (bad key, wrong URL, rate limit...).
     const retryable = index < attempts.length - 1 && response.status >= 400 && response.status < 500
@@ -364,25 +397,41 @@ const normalizeTemperature = (value) => {
 
 module.exports = function activate(api) {
   let disposed = false;
-  let inFlight = null; // AbortController of the request the AI is currently answering
+  /* Every request still on the wire. A single slot was not enough: a prefetch does
+   * not hold the renderer's `busy`, so it can be in flight while a command starts
+   * another one, and deactivation has to abort both (the older one would otherwise
+   * keep running for up to REQUEST_TIMEOUT_MS after the mod was switched off). */
+  const inFlight = new Set();
 
   /* Disabling the mod (or quitting) aborts whatever is still on the wire, so a
    * late answer cannot be handed back to a renderer that is already gone. */
   api.lifecycle.onDeactivate(() => {
     disposed = true;
-    try {
-      inFlight?.abort();
-    } catch {
-      /* already settled */
-    }
-    inFlight = null;
+    inFlight.forEach((controller) => {
+      try {
+        controller.abort();
+      } catch {
+        /* already settled */
+      }
+    });
+    inFlight.clear();
   });
 
   const credentials = createCredentialStore(api);
 
-  api.rpc.handle('credential.status', () => credentials.status());
-  api.rpc.handle('credential.set', (payload) => credentials.setKey(payload?.key));
-  api.rpc.handle('credential.clear', () => credentials.clear());
+  /* Guarded like `decide`: writing the credential store after teardown would touch
+   * the mod's data file on behalf of a mod that is no longer running. */
+  api.rpc.handle('credential.status', () => (
+    disposed ? { configured: false, encrypted: false, canEncrypt: false, undecryptable: false } : credentials.status()
+  ));
+  api.rpc.handle('credential.set', async (payload) => {
+    if (disposed) throw new Error('模组已停用');
+    return credentials.setKey(payload?.key);
+  });
+  api.rpc.handle('credential.clear', async () => {
+    if (disposed) throw new Error('模组已停用');
+    return credentials.clear();
+  });
 
   api.rpc.handle('decide', async (payload) => {
     if (disposed) throw new Error('模组已停用');
@@ -417,7 +466,7 @@ module.exports = function activate(api) {
     api.log.info(`请求 AI 决策（${model}，${Array.isArray(payload?.modes) ? payload.modes.length : 0} 个模式）`);
 
     const controller = new AbortController();
-    inFlight = controller;
+    inFlight.add(controller);
     const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
     let raw;
     try {
@@ -434,7 +483,7 @@ module.exports = function activate(api) {
       });
     } finally {
       clearTimeout(timer);
-      if (inFlight === controller) inFlight = null;
+      inFlight.delete(controller);
     }
 
     let parsed;
